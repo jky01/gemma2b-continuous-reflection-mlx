@@ -40,34 +40,54 @@ class ReflectiveGemma(nn.Module):
         )
 
     def first_pass_hidden_state(self, input_ids: mx.array) -> mx.array:
-        """取得第一次傳遞、最後一層、最後一個 token 的 hidden state。
+        """第一次傳遞，取最後一層、最後一個 token 的 hidden state。
 
-        TODO:
-            - 需要呼叫 base_model 並要求回傳 hidden_states（而非僅 logits）。
-            - 多數 mlx-lm 模型預設只回傳 logits，需要修改/包裝其
-              forward 方法，讓最後一層輸出（pre-lm-head）也能取得。
+        mlx-lm 的 model.model（GemmaModel）回傳 (hidden_states, cache)，
+        hidden_states.shape = (batch, seq_len, hidden_size)。
+
+        Returns:
+            shape (batch, hidden_size)
         """
-        raise NotImplementedError("TODO: 攔截並回傳 H_top, shape (batch, hidden_size)")
+        hidden_states, _ = self.base_model.model(input_ids)
+        return hidden_states[:, -1, :]  # 最後一個 token 的高階特徵
 
     def embed_tokens(self, input_ids: mx.array) -> mx.array:
-        """取得輸入字串的 token embedding，用於和 P_soft 拼接。"""
-        raise NotImplementedError("TODO: 回傳 shape (batch, seq_len, hidden_size)")
+        """取得 token embedding，供第二次傳遞拼接用。
+
+        Returns:
+            shape (batch, seq_len, hidden_size)
+        """
+        return self.base_model.model.embed_tokens(input_ids)
+
+    def _second_pass(self, x_combined: mx.array) -> mx.array:
+        """以預先計算的 embedding（含虛擬代幣）執行第二次傳遞。
+
+        使用 mlx-lm >= 0.18.0 的 inputs_embeds 參數直接跳過 embed_tokens，
+        讓虛擬代幣與原始 embedding 的拼接向量進入 transformer body。
+
+        Args:
+            x_combined: shape (batch, num_virtual_tokens + seq_len, hidden_size)
+
+        Returns:
+            logits: shape (batch, num_virtual_tokens + seq_len, vocab_size)
+        """
+        hidden_states, _ = self.base_model.model(inputs_embeds=x_combined)
+        return self.base_model.lm_head(hidden_states)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        # 第一次傳遞
-        h_top = self.first_pass_hidden_state(input_ids)
+        # 第一次傳遞：提取高階特徵
+        h_top = self.first_pass_hidden_state(input_ids)           # (batch, hidden_size)
 
-        # Adapter 轉譯
-        p_soft = self.adapter(h_top)  # (batch, num_virtual_tokens, hidden_size)
+        # Adapter 轉譯：生成虛擬代幣（soft prompts）
+        p_soft = self.adapter(h_top)                               # (batch, N_v, hidden_size)
 
-        # 拼接
-        input_embeds = self.embed_tokens(input_ids)  # (batch, seq_len, hidden_size)
-        x_second = mx.concatenate([p_soft, input_embeds], axis=1)
+        # 拼接：虛擬代幣前置於原始 token embedding
+        input_embeds = self.embed_tokens(input_ids)                # (batch, seq_len, hidden_size)
+        x_second = mx.concatenate([p_soft, input_embeds], axis=1) # (batch, N_v+seq_len, hidden_size)
 
-        # 第二次傳遞（重新預測）
-        y_pred = self.base_model(inputs_embeds=x_second)
-        return y_pred
+        # 第二次傳遞：帶前綴脈絡重新預測
+        return self._second_pass(x_second)                         # (batch, N_v+seq_len, vocab_size)
 
     def trainable_parameters(self):
-        """只回傳 Adapter 的參數，Gemma 主體維持凍結。"""
+        """只回傳 Adapter 的參數（Gemma 主體由外部 freeze() 凍結）。"""
         return self.adapter.parameters()
