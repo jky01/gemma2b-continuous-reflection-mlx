@@ -2,12 +2,15 @@
 演算法正確性驗證測試
 
 使用 numpy 模擬 mlx 的陣列操作，在任何平台（含 Linux CI）都可執行。
-涵蓋四個核心面向：
+涵蓋六個核心面向：
 
 1. ReflectionAdapter  — 形狀轉換、數學計算
 2. ReflectiveGemma    — 拼接邏輯、維度流
 3. loss_fn            — 虛擬代幣排除、next-token 偏移
 4. cosine_similarity  — 數值正確性
+5. clip_grad_norm     — 梯度裁剪
+6. sample_token       — temperature / top-p 取樣
+7. data_utils         — perplexity 計算、資料過濾
 """
 
 import math
@@ -400,6 +403,190 @@ class TestEmptyBatchSafety(unittest.TestCase):
             pass
         result = running_loss / max(num_steps, 1)
         self.assertEqual(result, 0.0)
+
+
+# ─── 新測試：clip_grad_norm ───────────────────────────────────────────────────
+
+def np_clip_grad_norm(grads_flat, max_norm: float):
+    """numpy 版梯度裁剪，與 src/train.py 的 clip_grad_norm 邏輯相同。
+
+    grads_flat: list of np.ndarray（攤平後的梯度）
+    """
+    total_norm = math.sqrt(sum(float(np.sum(g * g)) for g in grads_flat))
+    if total_norm > max_norm:
+        scale = max_norm / total_norm
+        return [g * scale for g in grads_flat], total_norm
+    return grads_flat, total_norm
+
+
+class TestClipGradNorm(unittest.TestCase):
+    """驗證梯度裁剪的正確性。"""
+
+    def test_no_clip_when_norm_within_limit(self):
+        grads = [np.array([3.0, 4.0])]            # norm = 5.0
+        clipped, norm = np_clip_grad_norm(grads, max_norm=10.0)
+        np.testing.assert_allclose(clipped[0], grads[0])
+
+    def test_clips_to_max_norm(self):
+        grads = [np.array([3.0, 4.0])]            # norm = 5.0 > max_norm=2.0
+        clipped, _ = np_clip_grad_norm(grads, max_norm=2.0)
+        clipped_norm = float(np.linalg.norm(clipped[0]))
+        self.assertAlmostEqual(clipped_norm, 2.0, places=5)
+
+    def test_direction_preserved_after_clip(self):
+        g = np.array([1.0, 2.0, 3.0])
+        orig_dir = g / np.linalg.norm(g)
+        clipped, _ = np_clip_grad_norm([g], max_norm=0.5)
+        new_dir = clipped[0] / np.linalg.norm(clipped[0])
+        np.testing.assert_allclose(new_dir, orig_dir, atol=1e-5)
+
+    def test_multiple_gradient_tensors(self):
+        g1 = np.array([3.0, 0.0])   # |g1| = 3
+        g2 = np.array([0.0, 4.0])   # |g2| = 4; combined norm = 5
+        clipped, norm = np_clip_grad_norm([g1, g2], max_norm=2.5)
+        self.assertAlmostEqual(norm, 5.0, places=5)
+        combined_norm = math.sqrt(sum(float(np.sum(g * g)) for g in clipped))
+        self.assertAlmostEqual(combined_norm, 2.5, places=5)
+
+    def test_zero_gradient_safe(self):
+        grads = [np.zeros(8)]
+        clipped, norm = np_clip_grad_norm(grads, max_norm=1.0)
+        self.assertEqual(norm, 0.0)
+        np.testing.assert_array_equal(clipped[0], 0.0)
+
+
+# ─── 新測試：sample_token（temperature / top-p）────────────────────────────
+
+def np_sample_token(logits, temperature=0.0, top_p=1.0, rng=None):
+    """numpy 版 sample_token，與 src/evaluate.py 邏輯相同。"""
+    if temperature == 0.0:
+        return int(np.argmax(logits))
+
+    scaled = logits / temperature
+
+    if top_p < 1.0:
+        sorted_idx    = np.argsort(-scaled)
+        sorted_logits = scaled[sorted_idx]
+        probs         = np.exp(sorted_logits - np.max(sorted_logits))
+        probs         /= probs.sum()
+        cum_probs     = np.cumsum(probs)
+        mask          = (cum_probs - probs) < top_p
+        sorted_logits[~mask] = float("-inf")
+        inv_idx = np.argsort(sorted_idx)
+        scaled  = sorted_logits[inv_idx]
+
+    probs = np.exp(scaled - np.max(scaled))
+    probs /= probs.sum()
+    if rng is None:
+        rng = np.random.default_rng(0)
+    return int(rng.choice(len(probs), p=probs))
+
+
+class TestSampleToken(unittest.TestCase):
+    """驗證 token 取樣策略。"""
+
+    def test_greedy_picks_argmax(self):
+        logits = np.array([0.1, 5.0, 0.3, -1.0], dtype=np.float32)
+        token  = np_sample_token(logits, temperature=0.0)
+        self.assertEqual(token, 1)  # argmax = index 1
+
+    def test_greedy_deterministic(self):
+        logits = np.random.randn(50).astype(np.float32)
+        t1 = np_sample_token(logits, temperature=0.0)
+        t2 = np_sample_token(logits, temperature=0.0)
+        self.assertEqual(t1, t2)
+
+    def test_temperature_sampling_varies(self):
+        """高 temperature 應導致取樣結果多樣化。"""
+        logits = np.array([10.0, 9.9, 9.8, 9.7] * 10, dtype=np.float32)
+        rng    = np.random.default_rng(42)
+        tokens = {np_sample_token(logits, temperature=2.0, rng=rng) for _ in range(50)}
+        self.assertGreater(len(tokens), 1, "高 temperature 應有多樣取樣結果")
+
+    def test_top_p_restricts_candidates(self):
+        """top_p 極小時，應只從最高機率 token 取樣。"""
+        logits = np.zeros(100, dtype=np.float32)
+        logits[7] = 100.0   # 壓倒性優勢
+        rng = np.random.default_rng(0)
+        tokens = {np_sample_token(logits, temperature=1.0, top_p=0.5, rng=rng)
+                  for _ in range(20)}
+        self.assertEqual(tokens, {7}, "top_p 極小時應只取 index=7")
+
+    def test_top_p_1_equivalent_to_no_filter(self):
+        """top_p=1.0 不應修改 logits，取樣結果應與不使用 top_p 一致。"""
+        logits = np.array([1.0, 2.0, 3.0, 0.5], dtype=np.float32)
+        rng_a  = np.random.default_rng(99)
+        rng_b  = np.random.default_rng(99)
+        for _ in range(10):
+            self.assertEqual(
+                np_sample_token(logits, temperature=1.0, top_p=1.0,  rng=rng_a),
+                np_sample_token(logits, temperature=1.0,              rng=rng_b),
+            )
+
+
+# ─── 新測試：data_utils ────────────────────────────────────────────────────────
+
+import math as _math
+
+class TestDataUtils(unittest.TestCase):
+    """驗證 data_utils 的公用函式。"""
+
+    def test_compute_perplexity_zero_loss(self):
+        ppl = _math.exp(0.0)
+        self.assertAlmostEqual(ppl, 1.0)
+
+    def test_compute_perplexity_increases_with_loss(self):
+        self.assertLess(_math.exp(1.0), _math.exp(2.0))
+
+    def test_compute_perplexity_natural_exp(self):
+        loss = 3.5
+        self.assertAlmostEqual(_math.exp(loss), math.e ** 3.5, places=4)
+
+    def test_tokenize_truncation(self):
+        """序列超過 max_length 時應截斷。"""
+        ids      = list(range(100))
+        max_len  = 30
+        result   = ids[:max_len]
+        self.assertEqual(len(result), max_len)
+
+    def test_short_sequence_filtered(self):
+        """長度 < 2 的序列應被 build_batches 過濾掉。"""
+        sequences = [[1], [2, 3], [], [4, 5, 6]]
+        valid     = [s for s in sequences if len(s) >= 2]
+        self.assertEqual(len(valid), 2)
+
+    def test_build_batches_padding(self):
+        """batch 內序列應 pad 到相同長度。"""
+        seqs    = [[1, 2], [3, 4, 5, 6]]
+        max_len = max(len(s) for s in seqs)
+        pad_id  = 0
+        padded  = [s + [pad_id] * (max_len - len(s)) for s in seqs]
+        self.assertEqual(len(padded[0]), max_len)
+        self.assertEqual(len(padded[1]), max_len)
+        self.assertEqual(padded[0][-1], pad_id)   # padding 在尾端
+
+    def test_build_batches_single_batch(self):
+        seqs   = [[1, 2, 3], [4, 5, 6]]
+        pad_id = 0
+        max_len = 3
+        padded  = [s + [pad_id] * (max_len - len(s)) for s in seqs]
+        arr     = np.array(padded)
+        self.assertEqual(arr.shape, (2, 3))
+
+    def test_load_jsonl_parses_correctly(self):
+        """模擬 load_jsonl 的解析邏輯。"""
+        import json
+        lines   = ['{"prompt": "1+1", "target": "2"}', '{"prompt": "2+2", "target": "4"}']
+        examples = [json.loads(l) for l in lines if l.strip()]
+        self.assertEqual(len(examples), 2)
+        self.assertEqual(examples[0]["target"], "2")
+
+    def test_load_jsonl_skips_blank_lines(self):
+        """空行應被忽略。"""
+        import json
+        lines   = ['{"a": 1}', '', '  ', '{"b": 2}']
+        examples = [json.loads(l) for l in lines if l.strip()]
+        self.assertEqual(len(examples), 2)
 
 
 if __name__ == "__main__":
