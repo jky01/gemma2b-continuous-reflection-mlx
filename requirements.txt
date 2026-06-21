@@ -1,0 +1,7 @@
+mlx>=0.18.0
+mlx-lm>=0.18.0
+numpy
+tqdm
+datasets
+huggingface_hub
+matplotlib
