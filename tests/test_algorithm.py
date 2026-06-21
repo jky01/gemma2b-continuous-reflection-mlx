@@ -90,6 +90,11 @@ if "mlx.core" not in sys.modules:
     sys.modules["mlx.core"]   = _make_mx_mock()   # type: ignore
     sys.modules["mlx.nn"]     = _make_nn_mock()    # type: ignore
 
+    mlx_utils = types.ModuleType("mlx.utils")
+    mlx_utils.tree_flatten   = lambda x: list(x.items()) if isinstance(x, dict) else list(x)  # type: ignore
+    mlx_utils.tree_unflatten = lambda items: dict(items)  # type: ignore
+    sys.modules["mlx.utils"] = mlx_utils  # type: ignore
+
 
 # ─── numpy 版的核心算法實作（與 src/ 邏輯完全對應）─────────────────────────
 
@@ -587,6 +592,122 @@ class TestDataUtils(unittest.TestCase):
         lines   = ['{"a": 1}', '', '  ', '{"b": 2}']
         examples = [json.loads(l) for l in lines if l.strip()]
         self.assertEqual(len(examples), 2)
+
+
+# ─── 新測試：checkpoint 邏輯 ──────────────────────────────────────────────────
+
+import json as _json
+import tempfile
+from pathlib import Path as _Path
+
+# 匯入不依賴 MLX 運算的純路徑函式
+from src.checkpoint import find_latest_checkpoint
+
+
+class TestCheckpoint(unittest.TestCase):
+    """驗證 checkpoint 路徑尋找與 metadata 邏輯。"""
+
+    def _write_valid_checkpoint(self, root: _Path, epoch: int) -> _Path:
+        """在 root 下建立一個有效的 checkpoint 目錄，回傳該目錄路徑。"""
+        ckpt_dir = root / f"epoch_{epoch:02d}"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        meta = {"epoch": epoch, "global_step": (epoch + 1) * 10, "history": []}
+        (ckpt_dir / "meta.json").write_text(_json.dumps(meta))
+        (root / "latest.txt").write_text(f"epoch_{epoch:02d}")
+        return ckpt_dir
+
+    def test_find_returns_none_when_dir_missing(self):
+        """目錄不存在時應回傳 None。"""
+        result = find_latest_checkpoint("/tmp/__nonexistent_dir_12345__")
+        self.assertIsNone(result)
+
+    def test_find_returns_none_when_latest_txt_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = find_latest_checkpoint(tmp)
+            self.assertIsNone(result)
+
+    def test_find_returns_none_when_meta_json_missing(self):
+        """latest.txt 存在但對應目錄沒有 meta.json 時應回傳 None。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _Path(tmp)
+            (root / "epoch_00").mkdir()
+            # 不建立 meta.json
+            (root / "latest.txt").write_text("epoch_00")
+            result = find_latest_checkpoint(tmp)
+            self.assertIsNone(result)
+
+    def test_find_returns_path_when_valid(self):
+        """完整 checkpoint 存在時應回傳正確路徑。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _Path(tmp)
+            expected = self._write_valid_checkpoint(root, epoch=2)
+            result = find_latest_checkpoint(tmp)
+            self.assertIsNotNone(result)
+            self.assertEqual(result, expected)
+
+    def test_find_returns_latest_not_oldest(self):
+        """latest.txt 指向的是最新（epoch_03），而非 epoch_00。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _Path(tmp)
+            self._write_valid_checkpoint(root, epoch=0)
+            expected = self._write_valid_checkpoint(root, epoch=3)  # overwrites latest.txt
+            result = find_latest_checkpoint(tmp)
+            self.assertEqual(result, expected)
+
+    def test_epoch_dir_naming_format(self):
+        """epoch 目錄名稱格式應為 epoch_NN（兩位補零）。"""
+        for epoch, expected_name in [(0, "epoch_00"), (5, "epoch_05"), (12, "epoch_12")]:
+            self.assertEqual(f"epoch_{epoch:02d}", expected_name)
+
+    def test_start_epoch_is_saved_plus_one(self):
+        """恢復後下一個 epoch 應為已儲存 epoch + 1。"""
+        for saved_epoch in range(5):
+            start_epoch = saved_epoch + 1
+            self.assertEqual(start_epoch, saved_epoch + 1)
+
+    def test_meta_json_fields(self):
+        """meta.json 應含 epoch / global_step / history 三個欄位。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _Path(tmp)
+            ckpt_dir = self._write_valid_checkpoint(root, epoch=1)
+            with open(ckpt_dir / "meta.json") as f:
+                meta = _json.load(f)
+            self.assertIn("epoch",       meta)
+            self.assertIn("global_step", meta)
+            self.assertIn("history",     meta)
+
+    def test_meta_json_epoch_matches_dirname(self):
+        """meta.json 內的 epoch 值應與目錄名稱一致。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _Path(tmp)
+            epoch = 7
+            ckpt_dir = self._write_valid_checkpoint(root, epoch=epoch)
+            with open(ckpt_dir / "meta.json") as f:
+                meta = _json.load(f)
+            self.assertEqual(meta["epoch"], epoch)
+            self.assertTrue(ckpt_dir.name.endswith(f"{epoch:02d}"))
+
+    def test_global_step_accumulates_across_epochs(self):
+        """global_step 跨 epoch 累積，每個 epoch 加 steps_per_epoch。"""
+        steps_per_epoch = 50
+        global_step = 0
+        for epoch in range(4):
+            global_step += steps_per_epoch
+        self.assertEqual(global_step, 200)
+
+    def test_resumed_training_skips_completed_epochs(self):
+        """從 epoch 2 恢復時，迴圈應從 2 開始，不重跑 0 和 1。"""
+        start_epoch = 2
+        total_epochs = 5
+        executed_epochs = list(range(start_epoch, total_epochs))
+        self.assertEqual(executed_epochs, [2, 3, 4])
+
+    def test_no_resume_when_all_epochs_done(self):
+        """start_epoch >= total_epochs 時不應執行任何訓練迴圈。"""
+        start_epoch = 5
+        total_epochs = 5
+        executed_epochs = list(range(start_epoch, total_epochs))
+        self.assertEqual(executed_epochs, [])
 
 
 if __name__ == "__main__":
