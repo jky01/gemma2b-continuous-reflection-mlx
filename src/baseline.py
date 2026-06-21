@@ -15,20 +15,20 @@ import json
 import time
 from pathlib import Path
 
-# import mlx.core as mx
-# from mlx_lm import load
+import mlx.core as mx
+import mlx.nn as nn
 
 
 def load_model(model_path: str):
     """載入 Gemma 2B 並凍結主體權重。
 
-    TODO:
-        - 使用 mlx_lm.load(model_path) 取得 model, tokenizer
-        - 走訪 model.parameters()，將所有 leaf 設為不需要梯度
-          （MLX 預設不會自動追蹤梯度，凍結的重點在於 Phase 3
-          value_and_grad 時，只把 Adapter 的參數傳入即可）
+    MLX 預設不追蹤梯度；凍結的重點在於 Phase 3 value_and_grad 時，
+    只把 Adapter 的參數傳入（base_model 已 freeze() 標記為不可訓練）。
     """
-    raise NotImplementedError("TODO: 載入並回傳 (model, tokenizer)")
+    from mlx_lm import load
+    model, tokenizer = load(model_path)
+    model.freeze()
+    return model, tokenizer
 
 
 def load_dataset(dataset_path: str):
@@ -48,23 +48,34 @@ def load_dataset(dataset_path: str):
 def run_baseline(model, tokenizer, examples):
     """跑單向（single forward pass）推論，記錄平均 Cross-Entropy Loss 與記憶體峰值。
 
-    TODO:
-        - 對每個 example 做 tokenizer.encode(prompt)
-        - 呼叫 model(...) 取得 logits
-        - 計算與 target 的 cross entropy
-        - 用 mx.metal.get_peak_memory() 之類的 API 記錄記憶體峰值
+    採用 next-token prediction loss：logits[t] 預測 input_ids[t+1]。
     """
     total_loss = 0.0
     peak_memory_bytes = 0
 
-    for _ex in examples:
-        # TODO: 實作單個樣本的 forward + loss 計算
-        pass
+    for ex in examples:
+        text = f"{ex['prompt']} {ex.get('target', '')}"
+        ids = mx.array(tokenizer.encode(text))[None]  # (1, seq_len)
+
+        logits, _ = model(ids)  # (1, seq_len, vocab_size)
+
+        # Next-token prediction：position t 預測 position t+1
+        aligned_logits = logits[:, :-1, :]   # (1, seq_len-1, vocab_size)
+        aligned_targets = ids[:, 1:]          # (1, seq_len-1)
+
+        loss = nn.losses.cross_entropy(aligned_logits, aligned_targets, reduction="mean")
+        mx.eval(loss)
+        total_loss += loss.item()
+
+        if hasattr(mx, "metal"):
+            mem = mx.metal.get_active_memory()
+            if mem > peak_memory_bytes:
+                peak_memory_bytes = mem
 
     avg_loss = total_loss / max(len(examples), 1)
     return {
-        "avg_cross_entropy_loss": avg_loss,
-        "peak_memory_mb": peak_memory_bytes / (1024 * 1024),
+        "avg_cross_entropy_loss": round(avg_loss, 6),
+        "peak_memory_mb": round(peak_memory_bytes / (1024 * 1024), 2),
         "num_examples": len(examples),
     }
 
