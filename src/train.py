@@ -26,6 +26,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map
 
+from .checkpoint import load_checkpoint, save_checkpoint
 from .data_utils import build_batches, compute_perplexity, load_jsonl
 from .model_wrapper import ReflectiveGemma, ReflectiveGemmaConfig
 
@@ -133,6 +134,8 @@ def main():
     parser.add_argument("--output",         default="results/adapter_weights.safetensors")
     parser.add_argument("--checkpoint-dir", default="results/checkpoints",
                         help="每個 epoch 儲存 checkpoint 的目錄")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="自動從最新 checkpoint 繼續訓練（--no-resume 從頭開始）")
     args = parser.parse_args()
 
     from mlx_lm import load
@@ -165,15 +168,31 @@ def main():
 
     optimizer = optim.Adam(learning_rate=lr_schedule)
 
-    ckpt_dir = Path(args.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # ── Checkpoint 恢復 ────────────────────────────────────────────────────────
+    global_step = 0
+    start_epoch = 0
+    history: list = []
 
-    history = []
-    for epoch in range(args.epochs):
+    if args.resume:
+        start_epoch, global_step, history = load_checkpoint(
+            model, optimizer, args.checkpoint_dir
+        )
+
+    if start_epoch >= args.epochs:
+        print(
+            f"訓練已完成（start_epoch={start_epoch} >= epochs={args.epochs}）。"
+            f"若要繼續訓練，請增加 --epochs。"
+        )
+        return
+
+    # ── 訓練迴圈 ───────────────────────────────────────────────────────────────
+    for epoch in range(start_epoch, args.epochs):
         print(f"\n=== Epoch {epoch + 1}/{args.epochs} ===")
         train_loss = train_one_epoch(
             model, optimizer, train_batches, epoch, args.max_grad_norm
         )
+        global_step += len(train_batches)
+
         record = {"epoch": epoch, "train_loss": train_loss, "train_ppl": compute_perplexity(train_loss)}
 
         if val_batches:
@@ -186,9 +205,10 @@ def main():
 
         history.append(record)
 
-        # 每個 epoch 儲存 checkpoint
-        ckpt_path = ckpt_dir / f"epoch_{epoch:02d}.safetensors"
-        mx.save_safetensors(str(ckpt_path), dict(model.adapter.parameters()))
+        # 每個 epoch 存完整 checkpoint（adapter + optimizer state + metadata）
+        ckpt_path = save_checkpoint(
+            model, optimizer, epoch, global_step, history, args.checkpoint_dir
+        )
         print(f"  checkpoint → {ckpt_path}")
 
     # 儲存最終 Adapter 權重與訓練歷史
